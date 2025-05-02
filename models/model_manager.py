@@ -23,7 +23,7 @@ class ModelManager:
         try:
             # 1. 加载Whisper模型
             logger.info("加载Whisper模型...")
-            self.whisper_model = whisper.load_model("small")
+            self.whisper_model = whisper.load_model("turbo")
             logger.info("Whisper模型加载完成")
             
             # 2. 加载emotion2vec模型（使用FunASR）
@@ -52,21 +52,128 @@ class ModelManager:
     def recognize_speech(self, audio_path):
         """使用Whisper识别语音"""
         logger.info(f"识别音频: {audio_path}")
-        result = self.whisper_model.transcribe(audio_path, language="zh")
-        text = result["text"]
-        logger.info(f"识别结果: {text}")
-        return text
-    
-    # 修改analyze_emotion方法，添加更详细的打印
-    def analyze_emotion(self, text):
-        """分析文本情感或音频情感"""
-        logger.info(f"分析情感: {text}")
         
+        # 检查文件是否存在
+        if not os.path.exists(audio_path):
+            error_msg = f"音频文件不存在: {audio_path}"
+            logger.error(error_msg)
+            print(f"错误: {error_msg}")
+            return "【语音识别失败：未找到录音文件】"
+        
+        try:
+            # 明确指定language="zh"，确保使用中文识别
+            result = self.whisper_model.transcribe(
+                audio_path, 
+                language="zh",  # 指定语言为中文
+                task="transcribe",  # 指定任务为转写
+                initial_prompt="以下是简体中文的语音识别。"  # 添加引导提示，偏向简体输出
+            )
+            
+            text = result["text"]
+            
+            # 繁体转简体
+            if self.has_converter:
+                text = self.converter.convert(text)
+            
+            logger.info(f"识别结果: {text}")
+            return text
+        except Exception as e:
+            error_msg = f"语音识别出错: {str(e)}"
+            logger.error(error_msg)
+            return f"【语音识别失败：{str(e)}】"
+    
+    # 新增方法：使用大模型分析文本情感
+    def analyze_text_with_llm(self, text):
+        """使用大模型进行文本情感分析"""
+        try:
+            print("\n==== 大模型文本情感分析 ====")
+            print(f"输入文本: {text}")
+            
+            # 构建提示词，让大模型进行情感分析
+            prompt = f"""请分析以下文本的情感，只返回JSON格式的结果，包含以下情感类别的百分比(总和为100):
+积极、消极、中性
+
+同时分析出可能存在的具体情感，例如：高兴、愤怒、悲伤、厌恶、恐惧、惊讶等。
+文本: "{text}"
+
+JSON格式回答示例:
+{{
+  "情感分布": {{
+    "积极": 30.5,
+    "消极": 20.0,
+    "中性": 49.5
+  }},
+  "主导情感": "中性",
+  "具体情感": "平静"
+}}
+
+仅返回JSON格式，不要多余文字。"""
+            
+            # 使用大模型分析
+            response, _ = self.qwen_model.chat(self.qwen_tokenizer, prompt, history=None)
+            print(f"大模型情感分析原始返回: {response}")
+            
+            # 解析JSON结果
+            import json
+            import re
+            
+            # 提取JSON部分
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                emotions_data = json.loads(json_str)
+                
+                # 提取情感分布
+                emotions = emotions_data.get("情感分布", {})
+                if not emotions:  # 兼容可能的不同JSON格式
+                    emotions = {
+                        "积极": emotions_data.get("积极", 0),
+                        "消极": emotions_data.get("消极", 0),
+                        "中性": emotions_data.get("中性", 0)
+                    }
+                
+                # 确保有主要情感类别
+                for key in ["积极", "消极", "中性"]:
+                    if key not in emotions:
+                        emotions[key] = 0
+                        
+                # 提取具体情感
+                specific_emotion = emotions_data.get("具体情感", "未知")
+                
+                # 打印分析结果
+                print("情感分析结果:")
+                print(f"积极: {emotions['积极']:.2f}%")
+                print(f"消极: {emotions['消极']:.2f}%")
+                print(f"中性: {emotions['中性']:.2f}%")
+                print(f"主导情感: {max(emotions, key=emotions.get)}")
+                print(f"具体情感: {specific_emotion}")
+                
+                # 记录具体情感以便后续使用
+                self.last_text_emotions = {
+                    "distribution": emotions,
+                    "specific": specific_emotion
+                }
+                
+                return emotions
+            else:
+                print("无法解析大模型返回的情感分析结果，使用备用方法")
+                # 使用备用方法
+                return self._analyze_emotion_fallback(text)
+                
+        except Exception as e:
+            print(f"大模型情感分析出错: {str(e)}")
+            print("使用备用情感分析方法")
+            # 使用备用方法
+            return self._analyze_emotion_fallback(text)
+    
+    # 修改原来的方法为备用方法
+    def _analyze_emotion_fallback(self, text):
+        """基于规则的文本情感分析（作为备用）"""
         # 情感词典
         positive_words = ["满意", "喜欢", "感谢", "好", "优秀", "快", "棒", "赞", "方便", "效率", 
-                        "不错", "可以", "很好", "帮助", "满足", "高兴"]
+                         "不错", "可以", "很好", "帮助", "满足", "高兴"]
         negative_words = ["不满", "差", "慢", "退款", "投诉", "不行", "垃圾", "骗", "失望", "麻烦",
-                        "问题", "错误", "难用", "糟糕", "生气", "恼火"]
+                         "问题", "错误", "难用", "糟糕", "生气", "恼火"]
         
         # 计算积极和消极词的出现次数
         positive_matches = [word for word in positive_words if word in text]
@@ -76,7 +183,7 @@ class ModelManager:
         negative_count = len(negative_matches)
         
         # 打印匹配到的情感词
-        print("\n==== 文本情感分析 ====")
+        print("\n==== 备用文本情感分析 ====")
         print(f"输入文本: {text}")
         print(f"识别到的积极词: {positive_matches if positive_matches else '无'}")
         print(f"识别到的消极词: {negative_matches if negative_matches else '无'}")
@@ -113,10 +220,19 @@ class ModelManager:
         print(f"主导情感: {max(emotions, key=emotions.get)}")
         print("====================\n")
         
+        return emotions
+    
+    # 修改主要的analyze_emotion方法，调用大模型分析
+    def analyze_emotion(self, text):
+        """分析文本情感，使用大模型"""
+        logger.info(f"分析情感: {text}")
+        
+        # 使用大模型进行分析
+        emotions = self.analyze_text_with_llm(text)
+        
         logger.info(f"情感分析结果: {emotions}")
         return emotions
 
-    # 修复analyze_audio_emotion方法的缩进问题并添加打印输出
     def analyze_audio_emotion(self, audio_path):
         """使用emotion2vec分析音频情感"""
         try:
@@ -170,6 +286,12 @@ class ModelManager:
                 "悲伤(sad)", "惊讶(surprised)", "未知(unknown)"
             ]
             
+            # 保存原始情感分数以供后续使用
+            self.last_audio_emotions = {}
+            for i, label in enumerate(emotion_labels):
+                if i < len(scores):
+                    self.last_audio_emotions[label] = scores[i]
+            
             # 打印各情感分数
             print("各情感原始分数:")
             for i, label in enumerate(emotion_labels):
@@ -211,6 +333,70 @@ class ModelManager:
             print("====================\n")
             return default_emotions
     
+    # 新增多模态融合分析方法
+    def analyze_multimodal_emotion(self, text, audio_path):
+        """多模态情感分析：融合文本和音频的情感分析结果"""
+        print("\n==== 多模态情感分析 ====")
+        
+        # 文本情感分析
+        text_emotions = self.analyze_emotion(text)
+        print("文本情感分析完成")
+        
+        # 音频情感分析
+        audio_emotions = self.analyze_audio_emotion(audio_path)
+        print("音频情感分析完成")
+        
+        # 权重设置 (可以根据实际情况调整)
+        text_weight = 0.6   # 文本情感权重
+        audio_weight = 0.4  # 音频情感权重
+        
+        # 融合情感分析结果
+        combined_emotions = {}
+        for emotion in ["积极", "消极", "中性"]:
+            combined_emotions[emotion] = (
+                text_emotions[emotion] * text_weight + 
+                audio_emotions[emotion] * audio_weight
+            )
+        
+        # 打印融合结果
+        print("多模态情感融合结果:")
+        print(f"积极: {combined_emotions['积极']:.2f}% (文本: {text_emotions['积极']:.2f}%, 音频: {audio_emotions['积极']:.2f}%)")
+        print(f"消极: {combined_emotions['消极']:.2f}% (文本: {text_emotions['消极']:.2f}%, 音频: {audio_emotions['消极']:.2f}%)")
+        print(f"中性: {combined_emotions['中性']:.2f}% (文本: {text_emotions['中性']:.2f}%, 音频: {audio_emotions['中性']:.2f}%)")
+        print(f"主导情感: {max(combined_emotions, key=combined_emotions.get)}")
+        print("====================\n")
+        
+        # 保存多模态融合结果，以便生成响应时使用
+        self.last_multimodal_emotions = {
+            "text": text_emotions,
+            "audio": audio_emotions,
+            "combined": combined_emotions,
+            "text_specific": getattr(self, "last_text_emotions", {}).get("specific", "未知"),
+            "audio_specific": self._get_specific_audio_emotion(audio_emotions)
+        }
+        
+        return combined_emotions
+    
+    # 辅助方法：从音频情感获取具体情感
+    def _get_specific_audio_emotion(self, emotions):
+        """从音频情感分析结果中提取具体情感"""
+        # 根据主导情感类型，选择最有可能的具体情感
+        dominant = max(emotions, key=emotions.get)
+        
+        if dominant == "积极":
+            return "高兴"
+        elif dominant == "消极":
+            # 如果有last_audio_emotions，可以更精确地判断
+            if hasattr(self, "last_audio_emotions"):
+                scores = self.last_audio_emotions
+                if scores.get("生气(angry)", 0) > scores.get("悲伤(sad)", 0):
+                    return "愤怒"
+                else:
+                    return "悲伤"
+            return "不满"
+        else:
+            return "平静"
+    
     def generate_response(self, text, emotions):
         """使用Qwen生成回复"""
         logger.info(f"为文本生成回复: {text}")
@@ -218,70 +404,35 @@ class ModelManager:
         # 获取主导情感
         dominant_emotion = max(emotions, key=emotions.get)
         
-        # 具体情感映射
-        detailed_emotion_map = {
-            "积极": ["满意", "开心", "高兴", "兴奋", "愉快"],
-            "消极": ["愤怒", "不满", "失望", "焦虑", "悲伤", "烦恼"],
-            "中性": ["平静", "冷静", "中立"]
-        }
-        
-        # 检查是否有原始情感得分数据（来自analyze_audio_emotion方法）
-        detailed_emotions = ""
-        raw_emotions_available = False
-        
-        # 获取最近一次的音频分析结果
-        try:
-            if hasattr(self, 'last_audio_emotions') and isinstance(self.last_audio_emotions, dict):
-                detailed_emotions = "具体情感强度:\n"
-                emotion_types = [
-                    ("生气(angry)", "愤怒"),
-                    ("厌恶(disgusted)", "厌恶"),
-                    ("恐惧(fearful)", "恐惧"),
-                    ("高兴(happy)", "高兴"),
-                    ("悲伤(sad)", "悲伤"),
-                    ("惊讶(surprised)", "惊讶")
-                ]
-                
-                # 提取原始分数
-                scores = []
-                for label, chinese_name in emotion_types:
-                    for key, value in self.last_audio_emotions.items():
-                        if key.startswith(label.split("(")[0]):  # 匹配标签前缀
-                            scores.append((chinese_name, value))
-                            break
-                
-                # 按分数降序排序
-                scores.sort(key=lambda x: x[1], reverse=True)
-                
-                # 添加前三种主要情感
-                for i, (emotion_name, score) in enumerate(scores[:3]):
-                    if score > 0.05:  # 只显示显著的情感
-                        detailed_emotions += f"{emotion_name}: {score*100:.2f}%\n"
-                        raw_emotions_available = True
-        except Exception as e:
-            logger.error(f"获取详细情感失败: {str(e)}")
-        
-        # 如果没有详细情感数据，使用基于主导情感的猜测
-        if not raw_emotions_available:
-            import random
-            detailed_emotion = random.choice(detailed_emotion_map[dominant_emotion])
-            detailed_emotions = f"推测的具体情感: {detailed_emotion}"
-        
         # 构建情感文本描述
         emotion_text = "情感分析结果:\n"
         for emotion, value in emotions.items():
             emotion_text += f"{emotion}: {value:.2f}%\n"
         emotion_text += f"主导情感: {dominant_emotion}\n"
-        emotion_text += detailed_emotions
+        
+        # 检查是否有多模态融合结果
+        specific_emotion = "未知"
+        if hasattr(self, 'last_multimodal_emotions'):
+            emotion_text += "\n多模态情感分析:\n"
+            emotion_text += f"文本主要情感: {self.last_multimodal_emotions.get('text_specific', '未知')}\n"
+            emotion_text += f"语音主要情感: {self.last_multimodal_emotions.get('audio_specific', '未知')}\n"
+            specific_emotion = self.last_multimodal_emotions.get('text_specific', '未知')
+        elif hasattr(self, 'last_text_emotions'):
+            specific_emotion = self.last_text_emotions.get('specific', '未知')
+            emotion_text += f"具体情感: {specific_emotion}\n"
+        elif hasattr(self, 'last_audio_emotions'):
+            audio_specific = self._get_specific_audio_emotion(emotions)
+            emotion_text += f"语音情感: {audio_specific}\n"
+            specific_emotion = audio_specific
         
         # 构建包含详细情感分析的提示词
         prompt = f"""客户说: "{text}"
 
-    客户情绪分析:
-    {emotion_text}
+客户情绪分析:
+{emotion_text}
 
-    请根据客户的情绪状态生成一段专业、有同理心的客服回复，注意客户可能表现出的具体情感。
-    表现出对客户情绪的理解，并提供专业、积极的帮助:"""
+请根据客户的情绪状态生成一段专业、有同理心的客服回复，注意客户表现出的{specific_emotion}情感。
+表现出对客户情绪的理解，并提供专业、积极的帮助。使用简体中文回复:"""
         
         # 生成回复
         response, _ = self.qwen_model.chat(self.qwen_tokenizer, prompt, history=None)
